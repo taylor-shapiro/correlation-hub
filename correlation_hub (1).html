@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Correlation & Prediction Hub (Single-File)</title>
+  <style>
+    :root { --bg:#f7f7fb; --card:#fff; --text:#111; --muted:#666; --border:#e5e7eb; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; background:var(--bg); color:var(--text); }
+    header { padding: 16px 20px; background: linear-gradient(180deg, #ffffff, #fafafb); border-bottom:1px solid var(--border); position: sticky; top:0; z-index: 10; }
+    h1 { margin:0; font-size: 20px; }
+    .layout { display:flex; min-height: calc(100vh - 64px); }
+    aside { width: 260px; border-right:1px solid var(--border); background:#fff; padding: 12px; display:flex; flex-direction:column; gap:8px; }
+    .btn { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--border); background:#fff; padding:6px 10px; border-radius:8px; cursor:pointer; font-size:13px; }
+    .btn.primary { background:#111; color:#fff; border-color:#111; }
+    .btn.small { padding:4px 8px; font-size:12px; }
+    .btn.ghost { border-color:transparent; background:transparent; color:#444; }
+    .list { overflow:auto; }
+    .list-item { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; margin:4px 0; border:1px solid var(--border); border-radius:8px; background:#fff; cursor:pointer; }
+    .list-item.active { background:#f1f5f9; border-color:#cbd5e1; }
+    main { flex:1; padding: 16px; }
+    .grid { display:grid; gap:16px; }
+    .grid.cols-2 { grid-template-columns: 1fr 1fr; }
+    .grid.cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px; }
+    .muted { color:var(--muted); font-size:12px; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    label { display:block; font-size:12px; color:#555; margin-bottom:4px; }
+    select, input[type="number"], textarea { width:100%; border:1px solid var(--border); border-radius:10px; padding:8px; font-size:13px; background:#fff; }
+    textarea { min-height: 100px; }
+    .dropzone { border:2px dashed #d1d5db; padding:18px; border-radius:16px; text-align:center; background:#fff; }
+    .small { font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .section-title { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+    .spacer { height: 8px; }
+    .chart { height: 260px; }
+    .chartTall { height: 320px; }
+    code { background:#f3f4f6; padding:1px 4px; border-radius:6px; }
+  </style>
+  <!-- React + ReactDOM UMD (dev builds) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <!-- Babel for JSX in-browser (development) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Recharts UMD -->
+  <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+  <!-- PapaParse & SheetJS -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Correlation & Prediction Hub</h1>
+    <div class="muted">Single-file console • upload CSV/XLSX → map fields → lag correlations → OLS model</div>
+  </header>
+  <div id="root" class="layout"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useRef } = React;
+    const {
+      LineChart: ReLineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+      Legend, ResponsiveContainer, BarChart: ReBarChart, Bar
+    } = Recharts;
+
+    // ---------- Utilities ----------
+    const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const fmtDate = (d) => { try { return new Date(d).toISOString().slice(0,10); } catch { return String(d); } };
+    const monthKey = (date) => { const d = new Date(date); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}`; };
+    function parseNumber(v){ if(v==null||v==="") return null; let s=String(v).trim(); let sign=1; if(/^\(.+\)$/.test(s)){ sign=-1; s=s.slice(1,-1);} const hasPct=/%/.test(s); const n=Number(s.replace(/[\s,%]/g,"")); if(!Number.isFinite(n)) return null; return (hasPct?n/100:n)*sign; }
+    function aggregateMonthly(rows,{dateKey,valueKey,mode='mean'}){
+      const buckets=new Map();
+      for(const r of rows){ const d=r[dateKey]; const v=parseNumber(r[valueKey]); if(!d||v==null) continue; const k=monthKey(d); const e=buckets.get(k)||{date:new Date(`${k}-01T00:00:00Z`),values:[],sum:0}; e.values.push(v); e.sum+=v; buckets.set(k,e);}    
+      return Array.from(buckets.values()).sort((a,b)=>a.date-b.date).map(e=>({date:e.date,value: mode==='sum'? e.sum : e.values.reduce((s,x)=>s+x,0)/e.values.length}));
+    }
+    const pctChange = (s) => s.slice(1).map((p,i)=>({date:p.date, value: (p.value - s[i].value)/Math.abs(s[i].value)}));
+    const yoyChange = (s) => s.slice(12).map((p,i)=>({date:p.date, value: (p.value - s[i].value)/Math.abs(s[i].value)}));
+    const indexTo100 = (s) => { if(!s.length) return []; const b=s[0].value||1; return s.map(p=>({date:p.date, value:(p.value/b)*100})); };
+    function alignByDate(a,b){ const mapB=new Map(b.map(p=>[fmtDate(p.date),p.value])); const x=[],y=[]; for(const p of a){ const k=fmtDate(p.date); const va=p.value; const vb=mapB.get(k); if(va!=null && vb!=null){ x.push(va); y.push(vb); } } return [x,y]; }
+    function pearson(x,y){ const n=Math.min(x.length,y.length); if(n<3) return NaN; let sx=0,sy=0,sxx=0,syy=0,sxy=0; for(let i=0;i<n;i++){ sx+=x[i]; sy+=y[i]; sxx+=x[i]*x[i]; syy+=y[i]*y[i]; sxy+=x[i]*y[i]; } const cov=sxy-(sx*sy)/n; const vx=sxx-(sx*sx)/n; const vy=syy-(sy*sy)/n; const denom=Math.sqrt(vx*vy); return denom===0?NaN: cov/denom; }
+    const shiftSeries = (series, lag) => series.map(p=>({date:new Date(Date.UTC(p.date.getUTCFullYear(), p.date.getUTCMonth()+lag, 1)), value:p.value}));
+    const lagSweep = (driver, target, minLag, maxLag) => { const out=[]; for(let lag=minLag; lag<=maxLag; lag++){ const [x,y]=alignByDate(shiftSeries(driver,lag), target); out.push({lag, r: pearson(x,y)});} return out; };
+
+    // -------- Linear Regression (OLS) --------
+    const transpose = (A) => A[0].map((_,j)=>A.map(r=>r[j]));
+    function matMul(A,B){ const m=A.length,n=A[0].length,p=B[0].length; const out=Array.from({length:m},()=>Array(p).fill(0)); for(let i=0;i<m;i++){ for(let k=0;k<n;k++){ const aik=A[i][k]; for(let j=0;j<p;j++){ out[i][j]+=aik*B[k][j]; } } } return out; }
+    const identity = (n)=>{ const I=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) I[i][i]=1; return I; };
+    function inv(A){ const n=A.length; const M=A.map(r=>r.slice()); const I=identity(n); for(let i=0;i<n;i++){ let mr=i, mv=Math.abs(M[i][i]); for(let r=i+1;r<n;r++){ const v=Math.abs(M[r][i]); if(v>mv){mv=v; mr=r;} } if(mv===0) return null; if(mr!==i){ [M[i],M[mr]]=[M[mr],M[i]]; [I[i],I[mr]]=[I[mr],I[i]]; } const piv=M[i][i]; for(let j=0;j<n;j++){ M[i][j]/=piv; I[i][j]/=piv; } for(let r=0;r<n;r++) if(r!==i){ const f=M[r][i]; for(let j=0;j<n;j++){ M[r][j]-=f*M[i][j]; I[r][j]-=f*I[i][j]; } } } return I; }
+    function ols(X, y, ridge=1e-6){ const Xt=transpose(X); const XtX=matMul(Xt,X); for(let i=0;i<XtX.length;i++) XtX[i][i]+=ridge; const XtXinv=inv(XtX); if(!XtXinv) return null; const XtY=matMul(Xt, y.map(v=>[v])); const B=matMul(XtXinv,XtY).map(r=>r[0]); return B; }
+
+    // -------- Parsers --------
+    function parseCSV(file){
+      return new Promise((resolve)=>{
+        Papa.parse(file,{
+          header:true, skipEmptyLines:true, dynamicTyping:false,
+          complete:(res)=>resolve([{ id:uid(), name:file.name, rows:res.data||[], headers:res.meta?.fields||[], series:[] }]),
+          error:()=>resolve([])
+        });
+      });
+    }
+    function parseExcel(file){
+      // Uses Excel row 4 as header row (0-based index 3)
+      return new Promise((resolve)=>{
+        const reader=new FileReader();
+        reader.onload=(e)=>{
+          try{
+            const wb=XLSX.read(new Uint8Array(e.target.result),{type:"array"});
+            const HEADER_ROW_INDEX=3; // Excel row 4
+            const results=[];
+            wb.SheetNames.forEach((sheetName)=>{
+              const ws=wb.Sheets[sheetName]; if(!ws) return;
+              const aoa=XLSX.utils.sheet_to_json(ws,{header:1, defval:null, blankrows:false});
+              if(!aoa || aoa.length<=HEADER_ROW_INDEX) return;
+              const rawHeader=aoa[HEADER_ROW_INDEX]||[];
+              const seen=new Set();
+              const headers=rawHeader.map((h,i)=>{ let key=(h==null?"":String(h)).trim().replace(/\s+/g,"_"); if(!key) key=`col_${i+1}`; const base=key; let j=1; while(seen.has(key)){ key=`${base}_${j++}`;} seen.add(key); return key; });
+              const body=aoa.slice(HEADER_ROW_INDEX+1);
+              const rows=body.map(arr=>{ const obj={}; for(let i=0;i<headers.length;i++) obj[headers[i]]=arr[i]??null; return obj; })
+                             .filter(obj=>Object.values(obj).some(v=>v!==null && v!==""));
+              results.push({ id:uid(), name:`${file.name} — ${sheetName}`, rows, headers, series:[] });
+            });
+            resolve(results);
+          }catch(err){ resolve([]); }
+        };
+        reader.onerror=()=>resolve([]);
+        reader.readAsArrayBuffer(file);
+      });
+    }
+
+    // -------- Components --------
+    function FileDrop({onFiles}){
+      const inputRef=useRef(null);
+      return <div className="card">
+        <div className="dropzone"
+          onDragOver={(e)=>{e.preventDefault(); e.dataTransfer.dropEffect='copy';}}
+          onDrop={(e)=>{e.preventDefault(); onFiles(e.dataTransfer.files);} }
+        >
+          <div><strong>Upload Data Sets</strong></div>
+          <div className="muted">Drag & drop <code>.csv</code> or <code>.xlsx</code> files here, or use the button</div>
+          <div className="spacer"></div>
+          <input type="file" multiple ref={inputRef}
+            accept=".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xls,application/vnd.ms-excel"
+            style={{display:'none'}} onChange={(e)=>onFiles(e.target.files)} />
+          <button className="btn" onClick={()=>inputRef.current && inputRef.current.click()}>Choose files…</button>
+        </div>
+      </div>
+    }
+
+    function DatasetMapper({ds,onApply,defaultAgg}){
+      const headers=ds.headers||Object.keys(ds.rows[0]||{});
+      const [mapping,setMapping]=useState({ dateKey: headers[0]||'', valueKey: headers[1]||'', transform:'index', mode: defaultAgg||'mean' });
+      useEffect(()=>{ setMapping(m=>({...m, dateKey: headers[0]||m.dateKey, valueKey: headers[1]||m.valueKey })); },[ds.id]);
+      const preview=useMemo(()=>{ try{ const base=aggregateMonthly(ds.rows,{dateKey:mapping.dateKey, valueKey:mapping.valueKey, mode:mapping.mode}); if(mapping.transform==='pct') return pctChange(base); if(mapping.transform==='yoy') return yoyChange(base); return indexTo100(base);} catch{ return []; } },[ds.rows, mapping]);
+      return <div className="card">
+        <div className="row">
+          <div style={{flex:1}}>
+            <label>Date column</label>
+            <select value={mapping.dateKey} onChange={e=>setMapping({...mapping, dateKey:e.target.value})}>{headers.map(h=><option key={h} value={h}>{h}</option>)}</select>
+          </div>
+          <div style={{flex:1}}>
+            <label>Value column</label>
+            <select value={mapping.valueKey} onChange={e=>setMapping({...mapping, valueKey:e.target.value})}>{headers.map(h=><option key={h} value={h}>{h}</option>)}</select>
+          </div>
+          <div style={{flex:1}}>
+            <label>Transform</label>
+            <select value={mapping.transform} onChange={e=>setMapping({...mapping, transform:e.target.value})}>
+              <option value="index">Index to 100</option>
+              <option value="pct">MoM % Change</option>
+              <option value="yoy">YoY % Change</option>
+            </select>
+          </div>
+          <div style={{flex:1}}>
+            <label>Aggregation</label>
+            <select value={mapping.mode} onChange={e=>setMapping({...mapping, mode:e.target.value})}>
+              <option value="mean">Mean (rates/indices)</option>
+              <option value="sum">Sum (volumes/totals)</option>
+            </select>
+          </div>
+        </div>
+        <div className="spacer"></div>
+        <div className="chart">
+          <ResponsiveContainer width="100%" height="100%">
+            <ReLineChart data={preview.map(p=>({date:fmtDate(p.date), value:p.value}))}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="date" minTickGap={24} />
+              <YAxis />
+              <Tooltip />
+              <Legend />
+              <Line type="monotone" dataKey="value" name="Preview" dot={false} />
+            </ReLineChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="spacer"></div>
+        <button className="btn" onClick={()=>onApply(ds.id, mapping, preview)}>Apply Mapping</button>
+      </div>
+    }
+
+    // -------- Main App --------
+    function App(){
+      const [projects,setProjects]=useState(()=>{ try{ return JSON.parse(localStorage.getItem('cp_projects')||'[]'); }catch{return [];} });
+      const [activeId,setActiveId]=useState(()=> localStorage.getItem('cp_active') || null);
+      const [error,setError]=useState('');
+      const [defaults,setDefaults]=useState({ agg:'mean', lag:{min:-12,max:12}, topK:3 });
+      const active = projects.find(p=>p.id===activeId);
+
+      useEffect(()=>{ localStorage.setItem('cp_projects', JSON.stringify(projects)); },[projects]);
+      useEffect(()=>{ if(activeId) localStorage.setItem('cp_active', activeId); },[activeId]);
+
+      function createProject(){ const id=uid(); const p={ id, name:`Analysis ${projects.length+1}`, createdAt:new Date().toISOString(), datasets:[], targetId:null, driverIds:[], lagRange:{...defaults.lag}, topK:defaults.topK, notes:'' }; setProjects([p, ...projects]); setActiveId(id); }
+      function deleteProject(id){ const next=projects.filter(p=>p.id!==id); setProjects(next); if(activeId===id) setActiveId(next[0]?.id||null); }
+      function updateActive(patch){ setProjects(ps=>ps.map(p=>p.id===active.id?{...p, ...patch}:p)); }
+
+      async function addFiles(fileList){ if(!active) return; const files=Array.from(fileList||[]); const parsedArrays = await Promise.all(files.map(f=>/\.csv$/i.test(f.name)?parseCSV(f):parseExcel(f))); const newDs=parsedArrays.flat(); if(!newDs.length){ setError('No valid files added (.csv, .xlsx, .xls)'); return;} updateActive({ datasets:[...(active.datasets||[]), ...newDs]}); }
+      function applyMapping(dsId, mapping, series){ const datasets=active.datasets.map(d=>d.id===dsId?{...d, mapping, series}:d); updateActive({datasets}); }
+      function exportProject(){ if(!active) return; const blob=new Blob([JSON.stringify(active,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=(active.name||'analysis').replace(/\s+/g,'_')+'.json'; a.click(); URL.revokeObjectURL(url); }
+
+      // Derived
+      const ready = (active?.datasets||[]).filter(d=>Array.isArray(d.series)&&d.series.length);
+      const targetSeries = useMemo(()=> ready.find(d=>d.id===active?.targetId)?.series || [], [active,ready]);
+      const driverSeriesList = useMemo(()=> (active?.driverIds||[]).map(id=>ready.find(d=>d.id===id)).filter(Boolean).map(d=>({id:d.id,name:d.name,series:d.series})), [active,ready]);
+
+      const corrSummary = useMemo(()=>{
+        if(!targetSeries.length||!driverSeriesList.length) return [];
+        const out=[]; for(const d of driverSeriesList){ const sweep = lagSweep(d.series, targetSeries, active.lagRange.min, active.lagRange.max).filter(r=>Number.isFinite(r.r)); if(!sweep.length) continue; const best = sweep.reduce((a,b)=>Math.abs(b.r)>Math.abs(a.r)?b:a); out.push({ id:d.id, name:d.name, lag:best.lag, r:best.r, absR:Math.abs(best.r), sweep }); }
+        return out.sort((a,b)=>b.absR-a.absR);
+      },[driverSeriesList, targetSeries, active?.lagRange]);
+
+      // Simple multivariate OLS with top-k drivers at best lags
+      const model = useMemo(()=>{
+        if(!targetSeries.length || !corrSummary.length) return null;
+        const k = Math.max(1, Math.min(active.topK||3, corrSummary.length));
+        const chosen = corrSummary.slice(0,k);
+        const shifted = chosen.map(c=>({id:c.id, name:c.name, lag:c.lag, series: shiftSeries(driverSeriesList.find(d=>d.id===c.id).series, c.lag)}));
+        const mapT = new Map(targetSeries.map(p=>[fmtDate(p.date), p.value]));
+        const dates = Array.from(new Set(targetSeries.map(p=>fmtDate(p.date)))).sort();
+        const rows = [];
+        for(const d of dates){ const y=mapT.get(d); if(y==null) continue; const xs=[]; let ok=true; for(const s of shifted){ const m=new Map(s.series.map(p=>[fmtDate(p.date), p.value])); const v=m.get(d); if(v==null){ ok=false; break; } xs.push(v);} if(ok) rows.push({date:d, y, xs}); }
+        if(rows.length<24) return null;
+        const split = Math.floor(rows.length*0.8);
+        const train=rows.slice(0,split), test=rows.slice(split);
+        const fit=(data)=>{ const X=data.map(r=>[1,...r.xs]); const y=data.map(r=>r.y); const B=ols(X,y); if(!B) return null; const yhat=X.map(row=>row.reduce((s,v,i)=>s+v*B[i],0)); const err=y.map((v,i)=>v-yhat[i]); const meanY=y.reduce((s,v)=>s+v,0)/y.length; const ssTot=y.reduce((s,v)=>s+(v-meanY)**2,0); const ssRes=err.reduce((s,e)=>s+e*e,0); const r2=1-ssRes/ssTot; const rmse=Math.sqrt(ssRes/y.length); const mape=y.reduce((s,v,i)=>s+(v?Math.abs(err[i]/v):0),0)/y.length; return {B,yhat,r2,rmse,mape}; };
+        const tr=fit(train), te=fit(test); if(!tr||!te) return null;
+        const chart = rows.map((r,i)=>({ date:r.date, actual:r.y, predicted: i<split ? tr.yhat[i] : te.yhat[i-split], split: i<split? 'train':'test' }));
+        return { chosen, chart, split, metrics:{train:{r2:tr.r2, rmse:tr.rmse, mape:tr.mape}, test:{r2:te.r2, rmse:te.rmse, mape:te.mape}} };
+      },[corrSummary, targetSeries, driverSeriesList, active?.topK]);
+
+      return (
+        <div className="layout">
+          <aside>
+            <div className="row" style={{justifyContent:'space-between'}}>
+              <strong>Analyses</strong>
+              <button className="btn small" onClick={createProject}>+ New</button>
+            </div>
+            <div className="list">
+              {projects.map(p=> (
+                <div key={p.id} className={`list-item ${p.id===activeId?'active':''}`} onClick={()=>setActiveId(p.id)}>
+                  <div>
+                    <div style={{fontSize:13, fontWeight:600}}>{p.name}</div>
+                    <div className="muted">{new Date(p.createdAt||Date.now()).toLocaleDateString()}</div>
+                  </div>
+                  <button className="btn ghost small" onClick={(e)=>{e.stopPropagation(); deleteProject(p.id);}}>Del</button>
+                </div>
+              ))}
+            </div>
+            {active && <div style={{marginTop:'auto'}}>
+              <button className="btn small" onClick={()=>{ const name=prompt('Rename analysis', active.name); if(name) updateActive({name}); }}>Rename</button>
+              <button className="btn small" style={{marginLeft:8}} onClick={()=>{ const c={...active, id:uid(), name:active.name+' (Copy)', createdAt:new Date().toISOString()}; setProjects(ps=>[c,...ps]); setActiveId(c.id); }}>Duplicate</button>
+              <div className="spacer"></div>
+              <button className="btn" onClick={exportProject}>Export JSON</button>
+            </div>}
+          </aside>
+
+          <main>
+            {!active ? <div className="muted">Create an analysis to begin.</div> : (
+              <>
+                <div className="grid cols-2">
+                  <div className="card">
+                    <div className="section-title"><strong>1) Upload data</strong><span className="muted">CSV / XLSX (Excel row 4 used as headers)</span></div>
+                    <FileDrop onFiles={addFiles} />
+                  </div>
+                  <div className="card">
+                    <div className="section-title"><strong>2) Target & drivers</strong></div>
+                    <div className="grid cols-3">
+                      <div>
+                        <label>Target series</label>
+                        <select value={active.targetId||''} onChange={(e)=>updateActive({targetId:e.target.value})}>
+                          <option value="">— select —</option>
+                          {(active.datasets||[]).filter(d=>d.series?.length).map(d=> <option key={d.id} value={d.id}>{d.name}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label>Drivers</label>
+                        <select multiple value={active.driverIds||[]} onChange={(e)=>updateActive({ driverIds: Array.from(e.target.selectedOptions).map(o=>o.value) })}>
+                          {(active.datasets||[]).filter(d=>d.series?.length).map(d=> <option key={d.id} value={d.id}>{d.name}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label>Lag window (m)</label>
+                        <div className="row">
+                          <input type="number" value={active.lagRange?.min??-12} onChange={(e)=>updateActive({ lagRange:{...(active.lagRange||{}), min:Number(e.target.value)} })} />
+                          <input type="number" value={active.lagRange?.max??12} onChange={(e)=>updateActive({ lagRange:{...(active.lagRange||{}), max:Number(e.target.value)} })} />
+                        </div>
+                        <div className="muted">Positive lag = driver leads target</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="spacer"></div>
+
+                <div className="grid cols-2">
+                  <div className="card">
+                    <div className="section-title"><strong>3) Datasets</strong><span className="muted">Map date/value, choose transform & aggregation, then Apply</span></div>
+                    {(!active.datasets||!active.datasets.length) && <div className="muted">No datasets yet.</div>}
+                    {(active.datasets||[]).map(ds=> (
+                      <div key={ds.id} style={{marginBottom:12}}>
+                        <div className="row" style={{justifyContent:'space-between'}}>
+                          <div style={{fontWeight:600}}>{ds.name}</div>
+                          <button className="btn small" onClick={()=>updateActive({datasets: active.datasets.filter(d=>d.id!==ds.id)})}>Remove</button>
+                        </div>
+                        <DatasetMapper ds={ds} onApply={applyMapping} defaultAgg={defaults.agg} />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="card">
+                    <div className="section-title"><strong>4) Correlations</strong></div>
+                    {(!targetSeries.length) ? <div className="muted">Pick a target and at least one driver (after applying mappings).</div> : (
+                      <>
+                        <div className="chart">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <ReBarChart data={( () => ( ( () => { const arr = ( () => { const out=[]; const drivers = (active.driverIds||[])\
+                              .map(id=> (active.datasets||[]).find(d=>d.id===id))\
+                              .filter(Boolean)\
+                              .map(d=>({id:d.id,name:d.name,series:d.series}));
+                              const target = (active.datasets||[]).find(d=>d.id===active.targetId)?.series || [];
+                              for(const dr of drivers){ const sweep=lagSweep(dr.series,target, active.lagRange.min, active.lagRange.max).filter(r=>Number.isFinite(r.r)); if(!sweep.length) continue; const best=sweep.reduce((a,b)=> Math.abs(b.r)>Math.abs(a.r)?b:a); out.push({name:dr.name, absR: Math.min(1, Math.abs(best.r)||0)}); } return out; })(); return arr; })() )()}>
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis dataKey="name" interval={0} angle={-20} textAnchor="end" height={60} />
+                              <YAxis domain={[0,1]} />
+                              <Tooltip />
+                              <Legend />
+                              <Bar dataKey="absR" name="|r|" />
+                            </ReBarChart>
+                          </ResponsiveContainer>
+                        </div>
+                        <div className="muted">Bar chart shows |r| (best lag per driver).</div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <div className="spacer"></div>
+
+                <div className="grid cols-2">
+                  <div className="card">
+                    <div className="section-title"><strong>5) Prediction model (OLS)</strong><span className="muted">Top-k drivers at best lags • 80/20 split</span></div>
+                    {!targetSeries.length ? <div className="muted">Select target & drivers first.</div> : (
+                      <ModelView corrSummary={(() => { const target=targetSeries; const out=[]; for(const d of (active.driverIds||[]).map(id=> (active.datasets||[]).find(dd=>dd.id===id)).filter(Boolean).map(d=>({id:d.id,name:d.name,series:d.series})) ) { const res=lagSweep(d.series,target,active.lagRange.min,active.lagRange.max).filter(r=>Number.isFinite(r.r)); if(!res.length) continue; const best=res.reduce((a,b)=> Math.abs(b.r)>Math.abs(a.r)?b:a); out.push({id:d.id,name:d.name,lag:best.lag,r:best.r,absR:Math.abs(best.r), sweep:res}); } return out.sort((a,b)=>b.absR-a.absR); })()} active={active} />
+                    )}
+                  </div>
+
+                  <div className="card">
+                    <div className="section-title"><strong>6) Notes & export</strong></div>
+                    <textarea placeholder="Observations, hypotheses, next steps…" value={active.notes||''} onChange={(e)=>updateActive({notes:e.target.value})}></textarea>
+                    <div className="spacer"></div>
+                    <button className="btn" onClick={exportProject}>Export analysis JSON</button>
+                  </div>
+                </div>
+              </>
+            )}
+          </main>
+        </div>
+      );
+    }
+
+    function ModelView({corrSummary, active}){
+      const [result, setResult] = React.useState(null);
+      React.useEffect(()=>{
+        if(!corrSummary || !corrSummary.length) { setResult(null); return; }
+        const k = Math.max(1, Math.min(active.topK||3, corrSummary.length));
+        const chosen = corrSummary.slice(0,k);
+        const ready = (active.datasets||[]).filter(d=>Array.isArray(d.series)&&d.series.length);
+        const targetSeries = ready.find(d=>d.id===active.targetId)?.series || [];
+        const driverSeriesList = chosen.map(c=>({ id:c.id, name:c.name, series: shiftSeries(ready.find(d=>d.id===c.id).series, c.lag) }));
+        const mapT = new Map(targetSeries.map(p=>[fmtDate(p.date), p.value]));
+        const dates = Array.from(new Set(targetSeries.map(p=>fmtDate(p.date)))).sort();
+        const rows=[]; for(const d of dates){ const y=mapT.get(d); if(y==null) continue; const xs=[]; let ok=true; for(const s of driverSeriesList){ const m=new Map(s.series.map(p=>[fmtDate(p.date), p.value])); const v=m.get(d); if(v==null){ ok=false; break; } xs.push(v);} if(ok) rows.push({date:d,y,xs}); }
+        if(rows.length<24){ setResult(null); return; }
+        const split=Math.floor(rows.length*0.8);
+        const fit=(data)=>{ const X=data.map(r=>[1,...r.xs]); const y=data.map(r=>r.y); const B=ols(X,y); if(!B) return null; const yhat=X.map(row=>row.reduce((s,v,i)=>s+v*B[i],0)); const err=y.map((v,i)=>v-yhat[i]); const meanY=y.reduce((s,v)=>s+v,0)/y.length; const ssTot=y.reduce((s,v)=>s+(v-meanY)**2,0); const ssRes=err.reduce((s,e)=>s+e*e,0); const r2=1-ssRes/ssTot; const rmse=Math.sqrt(ssRes/y.length); const mape=y.reduce((s,v,i)=>s+(v?Math.abs(err[i]/v):0),0)/y.length; return {B,yhat,r2,rmse,mape}; };
+        const train=rows.slice(0,split), test=rows.slice(split);
+        const tr=fit(train), te=fit(test); if(!tr||!te){ setResult(null); return; }
+        const chart = rows.map((r,i)=>({ date:r.date, actual:r.y, predicted: i<split? tr.yhat[i] : te.yhat[i-split], split: i<split? 'train':'test' }));
+        setResult({ chosen, chart, split, metrics:{train:{r2:tr.r2, rmse:tr.rmse, mape:tr.mape}, test:{r2:te.r2, rmse:te.rmse, mape:te.mape}} });
+      }, [JSON.stringify(corrSummary), active.targetId]);
+
+      if(!result) return <div className="muted">Add mapped series, choose target/drivers, then the model will train automatically.</div>;
+
+      return (
+        <div>
+          <div className="chartTall">
+            <ResponsiveContainer width="100%" height="100%">
+              <ReLineChart data={result.chart}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" minTickGap={24} />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="actual" dot={false} />
+                <Line type="monotone" dataKey="predicted" dot={false} />
+              </ReLineChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="spacer"></div>
+          <div className="grid cols-3">
+            <div className="card"><strong>Train R²</strong><div>{result.metrics.train.r2.toFixed(3)}</div></div>
+            <div className="card"><strong>Test R²</strong><div>{result.metrics.test.r2.toFixed(3)}</div></div>
+            <div className="card"><strong>Test MAPE</strong><div>{(result.metrics.test.mape*100).toFixed(2)}%</div></div>
+          </div>
+          <div className="spacer"></div>
+          <div className="muted">Model = intercept + Σ (betaᵢ × driverᵢ at best lagᵢ). Uses Excel row 4 as headers.</div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
